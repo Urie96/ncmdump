@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -43,6 +44,43 @@ type MetaInfo struct {
 	Alias         []string        `json:"alias"`
 	TransNames    []interface{}   `json:"transNames"`
 	Format        string          `json:"format"`
+}
+
+// DjArtist mirrors the artist object inside DJ program metadata.
+type DjArtist struct {
+	Name string `json:"name"`
+	ID   string `json:"id"`
+}
+
+// DjAlbum mirrors the album object inside DJ program metadata.
+type DjAlbum struct {
+	Name   string `json:"name"`
+	PicUrl string `json:"picUrl"`
+}
+
+// DjTrack mirrors the track object inside DJ program metadata.
+type DjTrack struct {
+	ID       string      `json:"id"`
+	Name     string      `json:"name"`
+	Duration int         `json:"duration"`
+	Artists  []DjArtist  `json:"artists"`
+	Album    DjAlbum     `json:"album"`
+}
+
+// DjMainMusic mirrors the mainMusic object inside DJ program metadata.
+type DjMainMusic struct {
+	Name     string  `json:"name"`
+	CoverUrl string  `json:"coverUrl"`
+	Track    DjTrack `json:"track"`
+}
+
+// DjMetaInfo represents Netease DJ program metadata (dj: prefix).
+type DjMetaInfo struct {
+	ProgramID   string       `json:"programId"`
+	ProgramName string       `json:"programName"`
+	DjName      string       `json:"djName"`
+	MainMusic   DjMainMusic  `json:"mainMusic"`
+	Duration    int          `json:"duration"`
 }
 
 func buildKeyBox(key []byte) []byte {
@@ -107,6 +145,76 @@ func checkError(err error) {
 	}
 }
 
+// djMetaToMetaInfo maps a DJ program metadata structure into the standard MetaInfo.
+func djMetaToMetaInfo(dj *DjMetaInfo) MetaInfo {
+	m := MetaInfo{
+		MusicName: dj.ProgramName,
+		Duration:  dj.Duration,
+	}
+	// Prefer mainMusic.track name over programName
+	if dj.MainMusic.Track.Name != "" {
+		m.MusicName = dj.MainMusic.Track.Name
+	} else if dj.MainMusic.Name != "" {
+		m.MusicName = dj.MainMusic.Name
+	}
+
+	// Map artists from DjArtist slice to the [[string,int]] format
+	for _, a := range dj.MainMusic.Track.Artists {
+		id := 0
+		if a.ID != "" {
+			fmt.Sscanf(a.ID, "%d", &id)
+		}
+		m.Artist = append(m.Artist, []interface{}{a.Name, id})
+	}
+
+	// Album info
+	m.Album = dj.MainMusic.Track.Album.Name
+	m.AlbumPic = dj.MainMusic.Track.Album.PicUrl
+	if m.AlbumPic == "" {
+		m.AlbumPic = dj.MainMusic.CoverUrl
+	}
+
+	// Music ID from track
+	if dj.MainMusic.Track.ID != "" {
+		fmt.Sscanf(dj.MainMusic.Track.ID, "%d", &m.MusicID)
+	}
+
+	return m
+}
+
+// detectAudioFormat reads and decrypts the first few bytes of audio data from
+// the current file position to determine whether it is FLAC or MP3.
+// It seeks back to the original position afterwards.
+func detectAudioFormat(fp *os.File, deKeyData []byte) string {
+	origPos, _ := fp.Seek(0, io.SeekCurrent)
+	defer fp.Seek(origPos, io.SeekStart)
+
+	box := buildKeyBox(deKeyData)
+	head := make([]byte, 64)
+	_, err := fp.Read(head)
+	if err != nil {
+		return "mp3" // safe default
+	}
+
+	// Decrypt with key box (same algorithm used for audio data)
+	for i := 0; i < len(head); i++ {
+		j := byte((i + 1) & 0xff)
+		head[i] ^= box[(box[j]+box[(box[j]+j)&0xff])&0xff]
+	}
+
+	if len(head) >= 4 && string(head[:4]) == "fLaC" {
+		return "flac"
+	}
+	// ID3v2 tag header → MP3; also check MPEG sync word
+	if len(head) >= 3 && string(head[:3]) == "ID3" {
+		return "mp3"
+	}
+	if len(head) >= 2 && head[0] == 0xff && (head[1]&0xe0) == 0xe0 {
+		return "mp3"
+	}
+	return "mp3" // safe default
+}
+
 func processFile(name string) {
 	fp, err := os.Open(name)
 	if err != nil {
@@ -161,12 +269,24 @@ func processFile(name string) {
 	deData, err := decryptAes128Ecb(aesModifyKey, fixBlockSize(deModifyData))
 	checkError(err)
 
-	// 6 = len("music:")
-	deData = deData[6:]
-
 	var meta MetaInfo
-	err = json.Unmarshal(deData, &meta)
-	checkError(err)
+	rawMeta := string(deData)
+	switch {
+	case strings.HasPrefix(rawMeta, "music:"):
+		// 6 = len("music:")
+		err = json.Unmarshal(deData[6:], &meta)
+		checkError(err)
+	case strings.HasPrefix(rawMeta, "dj:"):
+		// 3 = len("dj:")
+		var djmeta DjMetaInfo
+		err = json.Unmarshal(deData[3:], &djmeta)
+		checkError(err)
+		meta = djMetaToMetaInfo(&djmeta)
+	default:
+		// Try stripping first 6 bytes as a fallback (legacy behaviour)
+		err = json.Unmarshal(deData[6:], &meta)
+		checkError(err)
+	}
 
 	// crc32 check
 	fp.Seek(4, 1)
@@ -183,6 +303,11 @@ func processFile(name string) {
 		}
 		return nil
 	}()
+
+	// Detect format from audio data if not specified in metadata (e.g. DJ programs)
+	if meta.Format == "" {
+		meta.Format = detectAudioFormat(fp, deKeyData)
+	}
 
 	box := buildKeyBox(deKeyData)
 	n := 0x8000
